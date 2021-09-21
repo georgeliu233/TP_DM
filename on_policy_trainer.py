@@ -1,5 +1,6 @@
 import os
 import time
+import json
 
 import numpy as np
 import tensorflow as tf
@@ -126,9 +127,10 @@ class OnPolicyTrainer(Trainer):
                 done_events = next_obs["Agent-LHC"].events
                 r = 0.0
                 if done_events.reached_goal or (done["Agent-LHC"] and not done_events.reached_max_episode_steps):
-                    r = 1.0
-                if done_events.collisions !=[]:
-                    r = -1.0
+                    r += 1.0
+                if done_events.collisions !=[] or episode_steps==998:
+                    r -= -1.0
+                r += next_obs['Agent-LHC'].ego_vehicle_state.speed*0.01
                 #self.memory.append(state, action, r, next_state, done["Agent-LHC"])
                 episode_return += r
 
@@ -155,7 +157,7 @@ class OnPolicyTrainer(Trainer):
 
                 self.local_buffer.add(
                     obs=obs, act=action, next_obs=next_obs,
-                    rew=reward, done=done_flag, logp=logp, val=val)
+                    rew=r, done=done_flag, logp=logp, val=val)
                 obs = next_obs
 
                 if done["Agent-LHC"] or episode_steps == self._episode_max_steps:
@@ -171,7 +173,7 @@ class OnPolicyTrainer(Trainer):
                         for _ in range(self.n_steps):
                             buffer_queue.append(obs)
 
-                    obs = np.array(list(buffer_queue))
+                        obs = np.array(list(buffer_queue))
                     n_epoisode += 1
                     fps = episode_steps / (time.time() - episode_start_time)
                     self.logger.info(
@@ -181,7 +183,7 @@ class OnPolicyTrainer(Trainer):
                     tf.summary.scalar(name="Common/training_episode_length", data=episode_steps)
                     tf.summary.scalar(name="Common/fps", data=fps)
                     self.return_log.append(episode_return)
-                    self.step_log.append(total_steps)
+                    self.step_log.append(int(total_steps))
                     with open('/home/haochen/SMARTS_test_TPDM/log_ppo.json','w',encoding='utf-8') as writer:
                         writer.write(json.dumps([self.return_log,self.step_log],ensure_ascii=False,indent=4))
                     episode_steps = 0
@@ -192,8 +194,8 @@ class OnPolicyTrainer(Trainer):
                     avg_test_return, avg_test_steps = self.evaluate_policy(total_steps)
                     self.eval_log.append(avg_test_return)
                     self.test_step.append(avg_test_steps)
-                        with open('/home/haochen/SMARTS_test_TPDM/log_test_ppo.json','w',encoding='utf-8') as writer:
-                    writer.write(json.dumps([self.eval_log,self.test_step],ensure_ascii=False,indent=4))
+                    with open('/home/haochen/SMARTS_test_TPDM/log_test_ppo.json','w',encoding='utf-8') as writer:
+                        writer.write(json.dumps([self.eval_log,self.test_step],ensure_ascii=False,indent=4))
                     self.logger.info("Evaluation Total Steps: {0: 7} Average Reward {1: 5.4f} over {2: 2} episodes".format(
                         total_steps, avg_test_return, self._test_episodes))
                     tf.summary.scalar(
@@ -293,7 +295,7 @@ class OnPolicyTrainer(Trainer):
                 choice_action = []
                 MAX_SPEED = 10
                 choice_action.append((act[0]+1)/2*MAX_SPEED)
-                if action[1]<= -1/3:
+                if act[1]<= -1/3:
                     choice_action.append(-1)
                 elif -1/3< act[1] <1/3:
                     choice_action.append(0)
@@ -307,9 +309,10 @@ class OnPolicyTrainer(Trainer):
                 done_events = next_obs["Agent-LHC"].events
                 r = 0.0
                 if done_events.reached_goal or (done["Agent-LHC"] and not done_events.reached_max_episode_steps):
-                    r = 1.0
-                if done_events.collisions !=[]:
-                    r = -1.0
+                    r += 1.0
+                if done_events.collisions !=[] or avg_test_steps==998:
+                    r -= -1.0
+                r += next_obs['Agent-LHC'].ego_vehicle_state.speed*0.01
                 #self.memory.append(state, action, r, next_state, done["Agent-LHC"])
                 # episode_return += r
 
