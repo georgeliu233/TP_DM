@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import math
 
 import numpy as np
 import tensorflow as tf
@@ -22,6 +23,7 @@ class OnPolicyTrainer(Trainer):
         self.eval_log = []
         self.step_log = []
         self.test_step = []
+        self.success_rate=[]
     
     def observation_adapter(self,env_obs):
         ego = env_obs.ego_vehicle_state
@@ -191,11 +193,12 @@ class OnPolicyTrainer(Trainer):
                     episode_start_time = time.time()
 
                 if total_steps % self._test_interval == 0:
-                    avg_test_return, avg_test_steps = self.evaluate_policy(total_steps)
+                    avg_test_return, avg_test_steps ,success_rate= self.evaluate_policy(total_steps)
                     self.eval_log.append(avg_test_return)
                     self.test_step.append(avg_test_steps)
+                    self.success_rate.append(success_rate)
                     with open('/home/haochen/SMARTS_test_TPDM/log_test_ppo.json','w',encoding='utf-8') as writer:
-                        writer.write(json.dumps([self.eval_log,self.test_step],ensure_ascii=False,indent=4))
+                        writer.write(json.dumps([self.eval_log,self.success_rate,self.test_step],ensure_ascii=False,indent=4))
                     self.logger.info("Evaluation Total Steps: {0: 7} Average Reward {1: 5.4f} over {2: 2} episodes".format(
                         total_steps, avg_test_return, self._test_episodes))
                     tf.summary.scalar(
@@ -232,6 +235,7 @@ class OnPolicyTrainer(Trainer):
                     for idx in range(int(self._policy.horizon / self._policy.batch_size)):
                         target = slice(idx * self._policy.batch_size,
                                        (idx + 1) * self._policy.batch_size)
+                        # print(target)
                         self._policy.train(
                             states=samples["obs"][target],
                             actions=samples["act"][target],
@@ -265,11 +269,13 @@ class OnPolicyTrainer(Trainer):
     def evaluate_policy(self, total_steps):
         avg_test_return = 0.
         avg_test_steps = 0
+        success_time = 0
         if self._save_test_path:
             replay_buffer = get_replay_buffer(
                 self._policy, self._test_env, size=self._episode_max_steps)
         for i in range(self._test_episodes):
             episode_return = 0.
+            episode_time = 0
             frames = []
             obs = self._test_env.reset()
             if self.state_input:
@@ -284,6 +290,7 @@ class OnPolicyTrainer(Trainer):
                 obs = np.array(list(buffer_queue))
 
             avg_test_steps += 1
+            flag=False
             for _ in range(self._episode_max_steps):
                 if self._normalize_obs:
                     obs = self._obs_normalizer(obs, update=False)
@@ -310,8 +317,9 @@ class OnPolicyTrainer(Trainer):
                 r = 0.0
                 if done_events.reached_goal or (done["Agent-LHC"] and not done_events.reached_max_episode_steps):
                     r += 1.0
-                if done_events.collisions !=[] or avg_test_steps==998:
+                if done_events.collisions !=[] or episode_time==998:
                     r -= -1.0
+                    flag =True
                 r += next_obs['Agent-LHC'].ego_vehicle_state.speed*0.01
                 #self.memory.append(state, action, r, next_state, done["Agent-LHC"])
                 # episode_return += r
@@ -322,6 +330,10 @@ class OnPolicyTrainer(Trainer):
                     next_obs = next_obs['Agent-LHC'].top_down_rgb.data
 
                 avg_test_steps += 1
+                episode_time+=1
+                if self.lstm:
+                    buffer_queue.append(next_obs)
+                    next_obs = np.array(list(buffer_queue))
                 if self._save_test_path:
                     replay_buffer.add(
                         obs=obs, act=act, next_obs=next_obs,
@@ -335,8 +347,11 @@ class OnPolicyTrainer(Trainer):
                 episode_return += r
                 obs = next_obs
                 if done['Agent-LHC']:
+                    # done_events = next_obs["Agent-LHC"].events
                     obs = self._test_env.reset()
                     obs = obs['Agent-LHC'].top_down_rgb.data
+                    if not flag:
+                        success_time+=1
                     break
             prefix = "step_{0:08d}_epi_{1:02d}_return_{2:010.4f}".format(
                 total_steps, i, episode_return)
@@ -352,4 +367,4 @@ class OnPolicyTrainer(Trainer):
                 tf.expand_dims(np.array(obs).transpose(2, 0, 1), axis=3),
                 tf.uint8)
             tf.summary.image('train/input_img', images, )
-        return avg_test_return / self._test_episodes, avg_test_steps / self._test_episodes
+        return avg_test_return / self._test_episodes, avg_test_steps / self._test_episodes, success_time/self._test_episodes

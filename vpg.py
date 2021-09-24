@@ -1,22 +1,30 @@
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.layers import Dense,Conv2D,GlobalAveragePooling2D
+from tensorflow.keras.layers import Dense,Conv2D,GlobalAveragePooling2D,LSTM,GlobalAveragePooling1D
 
 from tf2rl.algos.policy_base import OnPolicyAgent
-from tf2rl.policies.tfp_gaussian_actor import GaussianActor
+from tf2rl.policies.tfp_gaussian_actor import GaussianActor,Transformer_Blocks
 from tf2rl.policies.tfp_categorical_actor import CategoricalActor
 from tf2rl.envs.atari_wrapper import LazyFrames
 
 
 class CriticV(tf.keras.Model):
-    def __init__(self, state_shape, units, name='critic_v', hidden_activation='relu',state_input=False):
+    def __init__(self, state_shape, units, name='critic_v', hidden_activation='relu',state_input=False,lstm=False,trans=False):
         super().__init__(name=name)
-        if not state_input:
-            self.conv_layers = [Conv2D(16, 3, strides=3, activation='relu'), Conv2D(64, 3, strides=2, activation='relu'), 
-                                    Conv2D(128, 3, strides=2, activation='relu'), Conv2D(256, 3, strides=2, activation='relu'), 
-                                    GlobalAveragePooling2D()]
-        else:
-            self.conv_layers =[Dense(256,activation='relu')]*2
+        self.lstm=lstm
+        self.trans=trans
+        if not trans:
+            if not state_input:
+                self.conv_layers = [Conv2D(16, 3, strides=3, activation='relu'), Conv2D(64, 3, strides=2, activation='relu'), 
+                                        Conv2D(128, 3, strides=2, activation='relu'), Conv2D(256, 3, strides=2, activation='relu'), 
+                                        GlobalAveragePooling2D()]
+            else:
+                self.conv_layers =[Dense(256,activation='relu')]*2
+        
+        if self.lstm:
+            self.conv_layers = [LSTM(256,return_sequences=True),GlobalAveragePooling1D()]+self.conv_layers
+        elif trans:
+            self.trans_layer = Transformer_Blocks() 
 
         self.l1 = Dense(units[0], name="L1", activation=hidden_activation)
         self.l2 = Dense(units[1], name="L2", activation=hidden_activation)
@@ -26,9 +34,13 @@ class CriticV(tf.keras.Model):
             self(tf.constant(
                 np.zeros(shape=(1,)+state_shape, dtype=np.float32)))
 
-    def call(self, inputs):
-        for layer in self.conv_layers:
-            inputs = layer(inputs)
+    def call(self, inputs,training=True):
+        if self.trans:
+            pooled = self.trans_layer(inputs,training)
+            inputs = pooled[1] 
+        else:
+            for layer in self.conv_layers:
+                inputs = layer(inputs)
         features = self.l1(inputs)
         features = self.l2(features)
         values = self.l3(features)
@@ -56,11 +68,14 @@ class VPG(OnPolicyAgent):
             state_input=False,
             lstm=False,
             residual=False,
+            trans=False,
             **kwargs):
         super().__init__(name=name, **kwargs)
         self._is_discrete = is_discrete
         self.state_input = state_input
         self.lstm = lstm
+        self.trans = trans
+        
         self.residual = residual
         # TODO: clean codes
         if actor_critic is not None:
@@ -82,13 +97,13 @@ class VPG(OnPolicyAgent):
                     #     state_independent_std=True)
                     self.actor = GaussianActor(
                         state_shape, action_dim, max_action, squash=True,
-                        state_input=self.state_input,residual=self.residual,lstm=self.lstm
+                        state_input=self.state_input,residual=self.residual,lstm=self.lstm,trans=self.trans
                     )
             else:
                 self.actor = actor
             if critic is None:
                 self.critic = CriticV(state_shape, critic_units,
-                                      hidden_activation=hidden_activation_critic,state_input=self.state_input)
+                                      hidden_activation=hidden_activation_critic,state_input=self.state_input,lstm=self.lstm,trans=self.trans)
             else:
                 self.critic = critic
             self.actor_optimizer = tf.keras.optimizers.Adam(
