@@ -8,6 +8,7 @@ import tensorflow as tf
 
 from cpprb import ReplayBuffer
 from collections import deque
+from utils import ZFilter
 
 from tf2rl.experiments.trainer import Trainer
 from tf2rl.experiments.utils import save_path, frames_to_gif
@@ -15,15 +16,54 @@ from tf2rl.misc.get_replay_buffer import get_replay_buffer, get_default_rb_dict
 from tf2rl.misc.discount_cumsum import discount_cumsum
 from tf2rl.envs.utils import is_discrete
 
+class NeighbourBuffer(object):
+    def __init__(self):
+        self.buffer = dict()
+
+    def add(self,ids,values):
+        if ids not in self.buffer:
+            self.buffer[ids] = list()
+        self.buffer[ids].append(values)
+    
+    def clear(self):
+        self.buffer = dict()
+    
+    def query(self,id_list,pad_length=0,pad_value=None):
+        res = []
+        for ids in id_list:
+
+            if pad_length >0:
+
+                line = self.buffer[ids]
+                num = min(pad_length,len(line))
+
+                if pad_value is None:
+                    #None then pad the last value
+                    v = line[-num:][0]
+                else:
+                    v = pad_value
+                
+                pad_line = [v]*(pad_length-num) + line[-num:]
+                res.append(pad_line)
+            else:
+                res.append(self.buffer[ids])
+        return res
 
 class OnPolicyTrainer(Trainer):
-    def __init__(self, *args, **kwargs):
+    def __init__(self,ego_surr=False,surr_vehicles=5,save_name='./ppo', *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.return_log = []
         self.eval_log = []
         self.step_log = []
         self.test_step = []
         self.success_rate=[]
+        self.ego_surr=ego_surr
+        self.surr_vehicles=surr_vehicles
+        self.save_name=save_name
+        print('normalized:',self._normalize_obs)
+
+        if self.ego_surr:
+            self.neighbours_buffer = NeighbourBuffer()
     
     def observation_adapter(self,env_obs):
         ego = env_obs.ego_vehicle_state
@@ -68,6 +108,54 @@ class OnPolicyTrainer(Trainer):
         )
         assert observations.shape[-1]==16,observations.shape
         return observations
+    
+    def ego_surr_adapter(self,obs):
+        # we only take (x,y,vx,vy,dis,psi) tuple for each state
+        ego= obs.ego_vehicle_state
+        neighbours = obs.neighborhood_vehicle_states
+
+        ego_state = [
+            ego.position[0],ego.position[1],
+            0.0,float(ego.heading)
+        ]
+        dis_list = []
+        min_ind = []
+        id_list = []
+        if len(neighbours)>0:
+            
+            for neighbour in neighbours:
+                x,y= neighbour.position[0],neighbour.position[1]
+                psi = float(neighbour.heading)
+                dis = np.sqrt((ego_state[0]-x)**2 + (ego_state[1]-y)**2)
+                self.neighbours_buffer.add(ids=neighbour.id, values=[x,y,dis,psi])
+                dis_list.append(dis)
+                id_list.append(neighbour.id)
+            
+            min_ind = np.argsort(dis_list)[:min(len(neighbours),self.surr_vehicles)]
+
+        #ego
+        res_ids = []
+        for ids in min_ind:
+            res_ids.append(id_list[ids])
+        final_obs = [ego_state]
+
+        # print(pos_diff)
+        # print(ego_state)
+        # print(dis_list)
+        # print(min_ind)
+
+        #neighbours sorted by distance
+        # for i in range(len(min_ind)):
+        #     final_obs.append(pos_diff[min_ind[i]])
+        
+        # #padding
+        # for i in range(self.surr_vehicles-len(min_ind)):
+        #     final_obs.append(ego_state)
+        
+        #(6,4)
+        # print(np.reshape(final_obs,(-1)))
+        # assert 1==0
+        return np.reshape(final_obs,(-1)),res_ids
 
     def __call__(self):
         # Prepare buffer
@@ -77,6 +165,8 @@ class OnPolicyTrainer(Trainer):
             size=self._policy.horizon, env=self._env)
         kwargs_local_buf["env_dict"]["logp"] = {}
         kwargs_local_buf["env_dict"]["val"] = {}
+        if self.lstm:
+            kwargs_local_buf["env_dict"]['mask'] = {}
         if is_discrete(self._env.action_space):
             kwargs_local_buf["env_dict"]["act"]["dtype"] = np.int32
         self.local_buffer = ReplayBuffer(**kwargs_local_buf)
@@ -87,24 +177,60 @@ class OnPolicyTrainer(Trainer):
         total_steps = np.array(0, dtype=np.int32)
         n_epoisode = 0
         obs = self._env.reset()
+        init_pos = obs['Agent-LHC'].ego_vehicle_state.position[:2]
         if self.state_input:
-            obs = self.observation_adapter(obs['Agent-LHC'])
+            if self.surr_vehicles:
+                obs,neighbor_ids = self.ego_surr_adapter(obs['Agent-LHC'])
+            else:
+                obs = self.observation_adapter(obs['Agent-LHC'])
         else:
             obs = obs['Agent-LHC'].top_down_rgb.data
         
         if self.lstm:
             buffer_queue = deque(maxlen=self.n_steps)
-            for _ in range(self.n_steps):
-                buffer_queue.append(obs)
-            obs = np.array(list(buffer_queue))
+            # for _ in range(self.n_steps):
+            buffer_queue.append(obs)
+            
+            if self.surr_vehicles:
+                #[num_of_neighbors,time_step(pad_length),4]
+                if len(neighbor_ids)>0:
+                    neighbors = self.neighbours_buffer.query(neighbor_ids,pad_length=1)
+                   
+                    neighbors = np.reshape(np.transpose(neighbors,[1,0,2]),(1,-1))
+                    # print(neighbors)
+                    # print(np.array(list(buffer_queue)))
+                    if len(neighbor_ids)<self.surr_vehicles:
+                        arr = np.array([ list(np.array(list(buffer_queue))[-1])*1 ]*(self.surr_vehicles-len(neighbor_ids)))
+                        out_obs = np.concatenate((np.array(list(buffer_queue)),
+                                    neighbors,
+                                    arr),
+                                    axis=-1)
+                    else:
+                        out_obs = np.concatenate((np.array(list(buffer_queue)),
+                                    neighbors),
+                                    axis=-1)
+                else:
+                    out_obs = np.concatenate((np.array(list(buffer_queue)),
+                                np.array([ list(np.array(list(buffer_queue))[-1])*1 ]*self.surr_vehicles)),
+                                axis=-1)
+            else:
+                out_obs = np.array(list(buffer_queue))
+            
+            obs = np.concatenate(( out_obs,np.array([np.zeros_like(out_obs[0])]*(self.n_steps-1)) ),axis=0)
+            mask = [1]+[0]*(self.n_steps-1)
+        else:
+            mask=None
+        
+        self.train_reward_scaler = ZFilter(shape=(),center=False,gamma=None)#self._policy.discount)
 
         tf.summary.experimental.set_step(total_steps)
+        init_dis = 0
         while total_steps < self._max_steps:
             # Collect samples
             for _ in range(self._policy.horizon):
                 if self._normalize_obs:
                     obs = self._obs_normalizer(obs, update=False)
-                action, logp, val = self._policy.get_action_and_val(obs)
+                action, logp, val = self._policy.get_action_and_val(obs,np.expand_dims(mask,0))
                 # if not is_discrete(self._env.action_space):
                 #     env_act = np.clip(act, self._env.action_space.low, self._env.action_space.high)
                 # else:
@@ -129,15 +255,30 @@ class OnPolicyTrainer(Trainer):
                 done_events = next_obs["Agent-LHC"].events
                 r = 0.0
                 if done_events.reached_goal or (done["Agent-LHC"] and not done_events.reached_max_episode_steps):
-                    r += 1.0
+                    r += 5.0
                 if done_events.collisions !=[] or episode_steps==998:
-                    r -= -1.0
-                r += next_obs['Agent-LHC'].ego_vehicle_state.speed*0.01
+                    r -= 10.0
+                # r += next_obs['Agent-LHC'].ego_vehicle_state.speed*0.01
+
+                r += next_obs['Agent-LHC'].ego_vehicle_state.speed/MAX_SPEED*0.1
+
+                
+                # curr_dis = next_obs['Agent-LHC'].distance_travelled
+                curr_pos = next_obs['Agent-LHC'].ego_vehicle_state.position[:2]
+                dis = np.linalg.norm(curr_pos-init_pos)
+                # print(curr_dis-init_dis,dis)
+                r += 0.2*(dis)
+
+                # init_dis = curr_dis
+                init_pos = curr_pos
                 #self.memory.append(state, action, r, next_state, done["Agent-LHC"])
                 episode_return += r
 
                 if self.state_input:
-                    next_obs = self.observation_adapter(next_obs['Agent-LHC'])
+                    if self.surr_vehicles:
+                        next_obs,neighbor_ids = self.ego_surr_adapter(next_obs['Agent-LHC'])
+                    else:
+                        next_obs = self.observation_adapter(next_obs['Agent-LHC'])
                 else:
                     next_obs = next_obs['Agent-LHC'].top_down_rgb.data
 
@@ -155,27 +296,96 @@ class OnPolicyTrainer(Trainer):
                 
                 if self.lstm:
                     buffer_queue.append(next_obs)
-                    next_obs = np.array(list(buffer_queue))
+                    stp_num = np.clip(episode_steps+1,0,self.n_steps)
+                    # next_obs = np.array(list(buffer_queue)+[np.zeros_like(next_obs)]*(self.n_steps-stp_num))
+                    if self.surr_vehicles:
+                        #[num_of_neighbors,time_step(pad_length),4]
+                        if len(neighbor_ids)>0:
+                            neighbors = self.neighbours_buffer.query(neighbor_ids,pad_length=stp_num)
 
-                self.local_buffer.add(
-                    obs=obs, act=action, next_obs=next_obs,
-                    rew=r, done=done_flag, logp=logp, val=val)
+                            neighbors = np.reshape(np.transpose(neighbors,[1,0,2]),(stp_num,-1))
+
+                            if len(neighbor_ids)<self.surr_vehicles:
+                                arr = np.array([ list(np.array(list(buffer_queue))[-1])*stp_num ]*(self.surr_vehicles-len(neighbor_ids)))
+                                out_obs = np.concatenate((np.array(list(buffer_queue)),
+                                            neighbors,
+                                            arr),
+                                            axis=-1)
+                            else:
+                                
+                                out_obs = np.concatenate((np.array(list(buffer_queue)),
+                                            neighbors),
+                                            axis=-1)
+                        else:
+                            out_obs = np.concatenate((np.array(list(buffer_queue)),
+                                        np.array([ list(np.array(list(buffer_queue))[-1])*stp_num ]*self.surr_vehicles)),
+                                        axis=-1)
+                    else:
+                        out_obs = np.array(list(buffer_queue))
+                    print(out_obs.shape)
+                    if stp_num<self.n_steps:
+                        next_obs = np.concatenate(( out_obs,np.array([np.zeros_like(out_obs[0])]*(self.n_steps-stp_num)) ),axis=0)
+                    else:
+                        next_obs = out_obs
+                    mask = np.array([1]*(stp_num) + [0]*(self.n_steps-stp_num))
+                    # print(next_obs.shape)
+                    self.local_buffer.add(
+                        obs=obs, act=action, next_obs=next_obs,
+                        rew=self.train_reward_scaler(r), done=done_flag, logp=logp, val=val,mask=mask)
+                else:
+                    self.local_buffer.add(
+                        obs=obs, act=action, next_obs=next_obs,
+                        rew=self.train_reward_scaler(r), done=done_flag, logp=logp, val=val)
                 obs = next_obs
 
                 if done["Agent-LHC"] or episode_steps == self._episode_max_steps:
                     tf.summary.experimental.set_step(total_steps)
+                    
                     self.finish_horizon()
                     obs = self._env.reset()
+                    self.train_reward_scaler.reset()
+                    init_dis = 0
+                    init_pos = obs['Agent-LHC'].ego_vehicle_state.position[:2]
+
+                    self.neighbours_buffer.clear()
+
                     if self.state_input:
-                        obs = self.observation_adapter(obs['Agent-LHC'])
+                        if self.surr_vehicles:
+                            obs,neighbor_ids = self.ego_surr_adapter(obs['Agent-LHC'])
+                        else:
+                            obs = self.observation_adapter(obs['Agent-LHC'])
                     else:
                         obs = obs['Agent-LHC'].top_down_rgb.data 
                     if self.lstm:
                         buffer_queue = deque(maxlen=self.n_steps)
-                        for _ in range(self.n_steps):
-                            buffer_queue.append(obs)
+                        # for _ in range(self.n_steps):
+                        buffer_queue.append(obs)
+                        if self.surr_vehicles:
+                            #[num_of_neighbors,time_step(pad_length),4]
+                            if len(neighbor_ids)>0:
+                                neighbors = self.neighbours_buffer.query(neighbor_ids,pad_length=1)
 
-                        obs = np.array(list(buffer_queue))
+                                neighbors = np.reshape(np.transpose(neighbors,[1,0,2]),(1,-1))
+                                if len(neighbor_ids)<self.surr_vehicles:
+                                    arr = np.array([ list(np.array(list(buffer_queue))[-1])*1 ]*(self.surr_vehicles-len(neighbor_ids)))
+                                    out_obs = np.concatenate((np.array(list(buffer_queue)),
+                                                neighbors,
+                                                arr),
+                                                axis=-1)
+                                else:
+                                    out_obs = np.concatenate((np.array(list(buffer_queue)),
+                                                neighbors),
+                                                axis=-1)
+                            else:
+                                out_obs = np.concatenate((np.array(list(buffer_queue)),
+                                            np.array([ list(np.array(list(buffer_queue))[-1])*1 ]*self.surr_vehicles)),
+                                            axis=-1)
+                        else:
+                            out_obs = np.array(list(buffer_queue))
+                        
+                        obs = np.concatenate(( out_obs,np.array([np.zeros_like(out_obs[0])]*(self.n_steps-1)) ),axis=0)
+                        mask = [1]+[0]*(self.n_steps-1)
+                        # obs = np.array(list(buffer_queue))
                     n_epoisode += 1
                     fps = episode_steps / (time.time() - episode_start_time)
                     self.logger.info(
@@ -186,7 +396,7 @@ class OnPolicyTrainer(Trainer):
                     tf.summary.scalar(name="Common/fps", data=fps)
                     self.return_log.append(episode_return)
                     self.step_log.append(int(total_steps))
-                    with open('/home/haochen/SMARTS_test_TPDM/log_ppo.json','w',encoding='utf-8') as writer:
+                    with open('/home/haochen/TPDM_transformer/'+self.save_name+'.json','w',encoding='utf-8') as writer:
                         writer.write(json.dumps([self.return_log,self.step_log],ensure_ascii=False,indent=4))
                     episode_steps = 0
                     episode_return = 0
@@ -197,10 +407,11 @@ class OnPolicyTrainer(Trainer):
                     self.eval_log.append(avg_test_return)
                     self.test_step.append(avg_test_steps)
                     self.success_rate.append(success_rate)
-                    with open('/home/haochen/SMARTS_test_TPDM/log_test_ppo.json','w',encoding='utf-8') as writer:
+                    
+                    with open('/home/haochen/TPDM_transformer/'+self.save_name+'_test.json','w',encoding='utf-8') as writer:
                         writer.write(json.dumps([self.eval_log,self.success_rate,self.test_step],ensure_ascii=False,indent=4))
-                    self.logger.info("Evaluation Total Steps: {0: 7} Average Reward {1: 5.4f} over {2: 2} episodes".format(
-                        total_steps, avg_test_return, self._test_episodes))
+                    self.logger.info("Evaluation Total Steps: {0: 7} Average Reward {1: 5.4f},success rate:{3}, over {2: 2} episodes".format(
+                        total_steps, avg_test_return, self._test_episodes,success_rate))
                     tf.summary.scalar(
                         name="Common/average_test_return", data=avg_test_return)
                     tf.summary.scalar(
@@ -217,36 +428,118 @@ class OnPolicyTrainer(Trainer):
             # Train actor critic
             if self._policy.normalize_adv:
                 samples = self.replay_buffer.get_all_transitions()
-                mean_adv = np.mean(samples["adv"])
-                std_adv = np.std(samples["adv"])
+                self.mean_adv = np.mean(samples["adv"])
+                self.std_adv = np.std(samples["adv"])
                 # Update normalizer
                 if self._normalize_obs:
                     self._obs_normalizer.experience(samples["obs"])
             with tf.summary.record_if(total_steps % self._save_summary_interval == 0):
                 for _ in range(self._policy.n_epoch):
-                    samples = self.replay_buffer._encode_sample(
-                        np.random.permutation(self._policy.horizon))
-                    if self._normalize_obs:
-                        samples["obs"] = self._obs_normalizer(samples["obs"], update=False)
-                    if self._policy.normalize_adv:
-                        adv = (samples["adv"] - mean_adv) / (std_adv + 1e-8)
+                    if False:
+                        self.slide_window_lstm()
                     else:
-                        adv = samples["adv"]
-                    for idx in range(int(self._policy.horizon / self._policy.batch_size)):
-                        target = slice(idx * self._policy.batch_size,
-                                       (idx + 1) * self._policy.batch_size)
-                        # print(target)
-                        self._policy.train(
-                            states=samples["obs"][target],
-                            actions=samples["act"][target],
-                            advantages=adv[target],
-                            logp_olds=samples["logp"][target],
-                            returns=samples["ret"][target])
+                        samples = self.replay_buffer._encode_sample(
+                            np.random.permutation(self._policy.horizon))
+                        if self._normalize_obs:
+                            samples["obs"] = self._obs_normalizer(samples["obs"], update=False)
+                        if self._policy.normalize_adv:
+                            adv = (samples["adv"] - self.mean_adv) / (self.std_adv + 1e-8)
+                        else:
+                            adv = samples["adv"]
+                        # print('training',int(self._policy.horizon / self._policy.batch_size))
+                        # print(adv.shape)
+                        
+                        # print(samples["obs"].shape)
+                        # print(samples["act"].shape)
+                        # print(samples["logp"].shape)
+                        # print(samples["ret"].shape)
+                        if 'mask' not in samples.keys():
+
+                            for idx in range(int(self._policy.horizon / self._policy.batch_size)):
+                                target = slice(idx * self._policy.batch_size,
+                                            (idx + 1) * self._policy.batch_size)
+                                # print(idx)
+                                # print(samples["obs"][target])
+                                # print(np.sum(np.isnan(samples["obs"][target])))
+                                # print(np.sum(np.isnan(samples["act"][target])))
+                                # print(np.sum(np.isnan(samples["logp"][target])))
+                                # print(np.sum(np.isnan(samples["ret"][target])))
+                                # print(np.sum(np.isnan(adv[target])))
+                                # np.savez(
+                                #     '/home/haochen/TPDM_transformer/test.npz',
+                                #     states=samples["obs"][target],
+                                #     actions=samples["act"][target],
+                                #     advantages=adv[target],
+                                #     logp_olds=samples["logp"][target],
+                                #     returns=samples["ret"][target]
+                                # )
+
+                                self._policy.train(
+                                    states=samples["obs"][target],
+                                    actions=samples["act"][target],
+                                    advantages=adv[target],
+                                    logp_olds=samples["logp"][target],
+                                    returns=samples["ret"][target])
+                        else:                
+                            for idx in range(int(self._policy.horizon / self._policy.batch_size)):
+                                target = slice(idx * self._policy.batch_size,
+                                            (idx + 1) * self._policy.batch_size)
+                                np.save('/home/haochen/TPDM_transformer/obs_test.npy',samples["obs"][target])
+                                assert 1==0
+                                self._policy.train(
+                                    states=samples["obs"][target],
+                                    actions=samples["act"][target],
+                                    advantages=adv[target],
+                                    logp_olds=samples["logp"][target],
+                                    returns=samples["ret"][target],
+                                    mask=np.array(samples['mask'][target]))
+
 
         tf.summary.flush()
 
+    def slide_window_lstm(self):
+        samples =self.replay_buffer.get_all_transitions()
+        new_sample = {
+            'obs':[],
+            'act':[],
+            'adv':[],
+            'logp':[],
+            'ret':[]
+        }
+        for i in range(self._policy.horizon-self.n_steps):
+            new_sample['obs'].append(samples['obs'][i:i+self.n_steps])
+            new_sample['ret'].append(samples['ret'][i:i+self.n_steps])
+            new_sample['act'].append(samples['act'][i:i+self.n_steps])
+            new_sample['logp'].append(samples['logp'][i:i+self.n_steps])
+
+            new_sample['adv'].append(samples['adv'][i:i+self.n_steps])
+        
+        if self._normalize_obs:
+            obs = self._obs_normalizer(np.array(new_sample["obs"]), update=False)
+        else:
+            obs = np.array(new_sample['obs'])
+        if self._policy.normalize_adv:
+            adv = (np.array(new_sample["adv"]) - self.mean_adv) / (self.std_adv + 1e-8)
+        else:
+            adv = np.array(new_sample["adv"])
+        
+        for idx in range(int(obs.shape[0] / self._policy.batch_size)):
+            target = slice(idx * self._policy.batch_size,
+                            (idx + 1) * self._policy.batch_size)
+            # print(target)
+            self._policy.train(
+                states=obs[target],
+                actions=np.array(new_sample['act'])[target],
+                advantages=adv[target],
+                logp_olds=np.array(new_sample["logp"])[target],
+                returns=np.array(new_sample["ret"])[target])
+        
+
+        
+
     def finish_horizon(self, last_val=0):
         self.local_buffer.on_episode_end()
+        
         samples = self.local_buffer._encode_sample(
             np.arange(self.local_buffer.get_stored_size()))
         rews = np.append(samples["rew"], last_val)
@@ -263,13 +556,15 @@ class OnPolicyTrainer(Trainer):
         rets = discount_cumsum(rews, self._policy.discount)[:-1]
         self.replay_buffer.add(
             obs=samples["obs"], act=samples["act"], done=samples["done"],
-            ret=rets, adv=advs, logp=np.squeeze(samples["logp"]))
+            ret=rets, adv=advs, logp=np.squeeze(samples["logp"]),mask=samples['mask'])
         self.local_buffer.clear()
+        
 
     def evaluate_policy(self, total_steps):
         avg_test_return = 0.
         avg_test_steps = 0
         success_time = 0
+        self.eval_reward_scaler = ZFilter(shape=(),center=False)
         if self._save_test_path:
             replay_buffer = get_replay_buffer(
                 self._policy, self._test_env, size=self._episode_max_steps)
@@ -278,23 +573,30 @@ class OnPolicyTrainer(Trainer):
             episode_time = 0
             frames = []
             obs = self._test_env.reset()
+            init_pos = obs['Agent-LHC'].ego_vehicle_state.position[:2]
             if self.state_input:
-                obs = self.observation_adapter(obs['Agent-LHC'])
+                if self.surr_vehicles:
+                    obs = self.ego_surr_adapter(obs['Agent-LHC'])
+                else:
+                    obs = self.observation_adapter(obs['Agent-LHC'])
             else:
                 obs = obs['Agent-LHC'].top_down_rgb.data
             
             if self.lstm:
                 buffer_queue = deque(maxlen=self.n_steps)
-                for _ in range(self.n_steps):
-                    buffer_queue.append(obs)
-                obs = np.array(list(buffer_queue))
+                # for _ in range(self.n_steps):
+                buffer_queue.append(obs)
+                # obs = np.array(list(buffer_queue))
+                obs = np.array(list(buffer_queue)+[np.zeros_like(obs)]*(self.n_steps-1))
+                mask = [1]+[0]*(self.n_steps-1)
 
             avg_test_steps += 1
             flag=False
+            init_dis=0
             for _ in range(self._episode_max_steps):
                 if self._normalize_obs:
                     obs = self._obs_normalizer(obs, update=False)
-                act, _ = self._policy.get_action(obs, test=True)
+                act, _ = self._policy.get_action(obs, test=True,mask=np.expand_dims(mask,0))
                 # act = (act if is_discrete(self._env.action_space) else
                 #        np.clip(act, self._env.action_space.low, self._env.action_space.high))
 
@@ -316,16 +618,29 @@ class OnPolicyTrainer(Trainer):
                 done_events = next_obs["Agent-LHC"].events
                 r = 0.0
                 if done_events.reached_goal or (done["Agent-LHC"] and not done_events.reached_max_episode_steps):
-                    r += 1.0
+                    r += 5.0
                 if done_events.collisions !=[] or episode_time==998:
-                    r -= -1.0
+                    r -= 10.0
                     flag =True
-                r += next_obs['Agent-LHC'].ego_vehicle_state.speed*0.01
+                r += next_obs['Agent-LHC'].ego_vehicle_state.speed/MAX_SPEED*0.1
+
+
+                # curr_dis = next_obs['Agent-LHC'].distance_travelled
+                curr_pos = next_obs['Agent-LHC'].ego_vehicle_state.position[:2]
+                dis = np.linalg.norm(curr_pos-init_pos)
+                # diff = curr_dis-init_dis
+                r += 0.2*(dis)
+
+                # init_dis = curr_dis
+                init_pos = curr_pos
                 #self.memory.append(state, action, r, next_state, done["Agent-LHC"])
                 # episode_return += r
 
                 if self.state_input:
-                    next_obs = self.observation_adapter(next_obs['Agent-LHC'])
+                    if self.surr_vehicles:
+                        next_obs = self.ego_surr_adapter(next_obs['Agent-LHC'])
+                    else:
+                        next_obs = self.observation_adapter(next_obs['Agent-LHC'])
                 else:
                     next_obs = next_obs['Agent-LHC'].top_down_rgb.data
 
@@ -333,7 +648,10 @@ class OnPolicyTrainer(Trainer):
                 episode_time+=1
                 if self.lstm:
                     buffer_queue.append(next_obs)
-                    next_obs = np.array(list(buffer_queue))
+                    stp_num = np.clip(episode_time+1,0,self.n_steps)
+                    next_obs = np.array(list(buffer_queue)+[np.zeros_like(next_obs)]*(self.n_steps-stp_num))
+                    mask = np.array([1]*(stp_num) + [0]*(self.n_steps-stp_num))
+
                 if self._save_test_path:
                     replay_buffer.add(
                         obs=obs, act=act, next_obs=next_obs,
@@ -349,9 +667,13 @@ class OnPolicyTrainer(Trainer):
                 if done['Agent-LHC']:
                     # done_events = next_obs["Agent-LHC"].events
                     obs = self._test_env.reset()
+                    self.eval_reward_scaler.reset()
+                    init_pos = obs['Agent-LHC'].ego_vehicle_state.position[:2]
                     obs = obs['Agent-LHC'].top_down_rgb.data
+
                     if not flag:
                         success_time+=1
+                    init_dis=0
                     break
             prefix = "step_{0:08d}_epi_{1:02d}_return_{2:010.4f}".format(
                 total_steps, i, episode_return)

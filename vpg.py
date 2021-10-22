@@ -22,7 +22,8 @@ class CriticV(tf.keras.Model):
                 self.conv_layers =[Dense(256,activation='relu')]*2
         
         if self.lstm:
-            self.conv_layers = [LSTM(256,return_sequences=True),GlobalAveragePooling1D()]+self.conv_layers
+            self.lstm_layer = LSTM(256,return_sequences=True)
+            self.conv_layers = [GlobalAveragePooling1D()]+self.conv_layers
         elif trans:
             self.trans_layer = Transformer_Blocks() 
 
